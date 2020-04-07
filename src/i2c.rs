@@ -5,14 +5,14 @@
 // https://www.st.com/content/ccc/resource/technical/document/application_note/5d/ae/a3/6f/08/69/4e/9b/CD00209826.pdf/files/CD00209826.pdf/jcr:content/translations/en.CD00209826.pdf
 
 use crate::afio::MAPR;
-use crate::time::Hertz;
 use crate::gpio::gpiob::{PB10, PB11, PB6, PB7, PB8, PB9};
 use crate::gpio::{Alternate, OpenDrain};
 use crate::hal::blocking::i2c::{Read, Write, WriteRead};
+use crate::pac::{DWT, I2C1, I2C2};
+use crate::rcc::{Clocks, Enable, GetBusFreq, RccBus, Reset, APB1};
+use crate::time::Hertz;
 use nb::Error::{Other, WouldBlock};
 use nb::{Error as NbError, Result as NbResult};
-use crate::rcc::{Clocks, APB1, Enable, Reset, RccBus, GetBusFreq};
-use crate::pac::{DWT, I2C1, I2C2};
 
 /// I2C error
 #[derive(Debug, Eq, PartialEq)]
@@ -51,11 +51,16 @@ pub enum Mode {
 
 impl Mode {
     pub fn standard<F: Into<Hertz>>(frequency: F) -> Self {
-        Mode::Standard{frequency: frequency.into()}
+        Mode::Standard {
+            frequency: frequency.into(),
+        }
     }
 
     pub fn fast<F: Into<Hertz>>(frequency: F, duty_cycle: DutyCycle) -> Self {
-        Mode::Fast{frequency: frequency.into(), duty_cycle}
+        Mode::Fast {
+            frequency: frequency.into(),
+            duty_cycle,
+        }
     }
 
     pub fn get_frequency(&self) -> Hertz {
@@ -264,7 +269,7 @@ macro_rules! hal {
 
                     let pclk1 = <$I2CX as RccBus>::Bus::get_frequency(&clocks).0;
 
-                    assert!(mode.get_frequency().0 <= 400_000);
+                    assert!(mode.get_frequency().0 <= 800_000);
 
                     let mut i2c = I2c { i2c, pins, mode, pclk1 };
                     i2c.init();
