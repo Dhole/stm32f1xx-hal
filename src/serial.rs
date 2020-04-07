@@ -38,24 +38,24 @@
 //!  ```
 
 use core::marker::PhantomData;
+use core::ops::Deref;
 use core::ptr;
 use core::sync::atomic::{self, Ordering};
-use core::ops::Deref;
 
-use nb;
 use crate::pac::{USART1, USART2, USART3};
 use core::convert::Infallible;
 use embedded_hal::serial::Write;
+use nb;
 
 use crate::afio::MAPR;
-use crate::dma::{dma1, CircBuffer, Static, Transfer, R, W, RxDma, TxDma};
+use crate::dma::{dma1, CircBuffer, RxDma, Static, Transfer, TxDma, R, W};
 use crate::gpio::gpioa::{PA10, PA2, PA3, PA9};
 use crate::gpio::gpiob::{PB10, PB11, PB6, PB7};
 use crate::gpio::gpioc::{PC10, PC11};
 use crate::gpio::gpiod::{PD5, PD6, PD8, PD9};
 use crate::gpio::{Alternate, Floating, Input, PushPull};
-use crate::rcc::{RccBus, Clocks, Enable, Reset, GetBusFreq};
-use crate::time::{U32Ext, Bps};
+use crate::rcc::{Clocks, Enable, GetBusFreq, RccBus, Reset};
+use crate::time::{Bps, U32Ext};
 
 /// Interrupt event
 pub enum Event {
@@ -79,7 +79,6 @@ pub enum Error {
     #[doc(hidden)]
     _Extensible,
 }
-
 
 // USART REMAPPING, see: https://www.st.com/content/ccc/resource/technical/document/reference_manual/59/b9/ba/7f/11/af/43/d5/CD00171190.pdf/files/CD00171190.pdf/jcr:content/translations/en.CD00171190.pdf
 // Section 9.3.8
@@ -182,18 +181,32 @@ pub struct Serial<USART, PINS> {
     pins: PINS,
 }
 
+impl<USART, PINS> Serial<USART, PINS> {
+    pub fn join(tx: Tx<USART, PINS>, _rx: Rx<USART, PINS>) -> Self
+    where
+        PINS: Pins<USART>,
+    {
+        Serial {
+            usart: tx._usart,
+            pins: tx._pins,
+        }
+    }
+}
+
 /// Serial receiver
-pub struct Rx<USART> {
-    _usart: PhantomData<USART>,
+pub struct Rx<USART, PINS> {
+    _usart: PhantomData<(USART, PINS)>,
 }
 
 /// Serial transmitter
-pub struct Tx<USART> {
-    _usart: PhantomData<USART>,
+pub struct Tx<USART, PINS> {
+    _pins: PINS,
+    _usart: USART,
+    // _usart: PhantomData<USART>,
 }
 
 /// Internal trait for the serial read / write logic.
-trait UsartReadWrite: Deref<Target=crate::stm32::usart1::RegisterBlock> {
+trait UsartReadWrite: Deref<Target = crate::stm32::usart1::RegisterBlock> {
     fn read(&self) -> nb::Result<u8, Error> {
         let sr = self.sr.read();
 
@@ -225,9 +238,7 @@ trait UsartReadWrite: Deref<Target=crate::stm32::usart1::RegisterBlock> {
             if sr.rxne().bit_is_set() {
                 // Read the received byte
                 // NOTE(read_volatile) see `write_volatile` below
-                Ok(unsafe {
-                    ptr::read_volatile(&self.dr as *const _ as *const _)
-                })
+                Ok(unsafe { ptr::read_volatile(&self.dr as *const _ as *const _) })
             } else {
                 Err(nb::Error::WouldBlock)
             }
@@ -240,9 +251,7 @@ trait UsartReadWrite: Deref<Target=crate::stm32::usart1::RegisterBlock> {
         if sr.txe().bit_is_set() {
             // NOTE(unsafe) atomic write to stateless register
             // NOTE(write_volatile) 8-bit write that's not possible through the svd2rust API
-            unsafe {
-                ptr::write_volatile(&self.dr as *const _ as *mut _, byte)
-            }
+            unsafe { ptr::write_volatile(&self.dr as *const _ as *mut _, byte) }
             Ok(())
         } else {
             Err(nb::Error::WouldBlock)
@@ -385,19 +394,31 @@ macro_rules! hal {
 
                 /// Separates the serial struct into separate channel objects for sending (Tx) and
                 /// receiving (Rx)
-                pub fn split(self) -> (Tx<$USARTX>, Rx<$USARTX>) {
+                pub fn split(self) -> (Tx<$USARTX, PINS>, Rx<$USARTX, PINS>) {
                     (
                         Tx {
-                            _usart: PhantomData,
+                            _pins: self.pins,
+                            _usart: self.usart,
+                            //_usart: PhantomData,
                         },
                         Rx {
                             _usart: PhantomData,
                         },
                     )
                 }
+
+                // pub fn join(tx: Tx<$USARTX, PINS>, _rx: Rx<$USARTX, PINS>) -> Self
+                // where
+                //     PINS: Pins<$USARTX>,
+                // {
+                //     Serial {
+                //         usart: tx._usart,
+                //         pins: tx._pins,
+                //     }
+                // }
             }
 
-            impl Tx<$USARTX> {
+            impl<PINS> Tx<$USARTX, PINS> {
                 pub fn listen(&mut self) {
                     unsafe { (*$USARTX::ptr()).cr1.modify(|_, w| w.txeie().set_bit()) };
                 }
@@ -407,7 +428,7 @@ macro_rules! hal {
                 }
             }
 
-            impl Rx<$USARTX> {
+            impl<PINS> Rx<$USARTX, PINS> {
                 pub fn listen(&mut self) {
                     unsafe { (*$USARTX::ptr()).cr1.modify(|_, w| w.rxneie().set_bit()) };
                 }
@@ -417,7 +438,7 @@ macro_rules! hal {
                 }
             }
 
-            impl crate::hal::serial::Read<u8> for Rx<$USARTX> {
+            impl<PINS> crate::hal::serial::Read<u8> for Rx<$USARTX, PINS> {
                 type Error = Error;
 
                 fn read(&mut self) -> nb::Result<u8, Error> {
@@ -425,7 +446,7 @@ macro_rules! hal {
                 }
             }
 
-            impl crate::hal::serial::Write<u8> for Tx<$USARTX> {
+            impl<PINS> crate::hal::serial::Write<u8> for Tx<$USARTX, PINS> {
                 type Error = Infallible;
 
                 fn flush(&mut self) -> nb::Result<(), Self::Error> {
@@ -460,9 +481,9 @@ macro_rules! hal {
     }
 }
 
-impl<USART> core::fmt::Write for Tx<USART>
+impl<USART, PINS> core::fmt::Write for Tx<USART, PINS>
 where
-    Tx<USART>: embedded_hal::serial::Write<u8>,
+    Tx<USART, PINS>: embedded_hal::serial::Write<u8>,
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         s.as_bytes()
@@ -496,14 +517,14 @@ hal! {
     ),
 }
 
-pub type Rx1 = Rx<USART1>;
-pub type Tx1 = Tx<USART1>;
-pub type Rx2 = Rx<USART2>;
-pub type Tx2 = Tx<USART2>;
-pub type Rx3 = Rx<USART3>;
-pub type Tx3 = Tx<USART3>;
+pub type Rx1<PINS> = Rx<USART1, PINS>;
+pub type Tx1<PINS> = Tx<USART1, PINS>;
+pub type Rx2<PINS> = Rx<USART2, PINS>;
+pub type Tx2<PINS> = Tx<USART2, PINS>;
+pub type Rx3<PINS> = Rx<USART3, PINS>;
+pub type Tx3<PINS> = Tx<USART3, PINS>;
 
-use crate::dma::{Transmit, Receive, TransferPayload};
+use crate::dma::{Receive, TransferPayload, Transmit};
 
 macro_rules! serialdma {
     ($(
@@ -515,20 +536,20 @@ macro_rules! serialdma {
         ),
     )+) => {
         $(
-            pub type $rxdma = RxDma<Rx<$USARTX>, $dmarxch>;
-            pub type $txdma = TxDma<Tx<$USARTX>, $dmatxch>;
+            pub type $rxdma<PINS> = RxDma<Rx<$USARTX, PINS>, $dmarxch>;
+            pub type $txdma<PINS> = TxDma<Tx<$USARTX, PINS>, $dmatxch>;
 
-            impl Receive for $rxdma {
+            impl<PINS> Receive for $rxdma<PINS> {
                 type RxChannel = $dmarxch;
                 type TransmittedWord = u8;
             }
 
-            impl Transmit for $txdma {
+            impl<PINS> Transmit for $txdma<PINS> {
                 type TxChannel = $dmatxch;
                 type ReceivedWord = u8;
             }
 
-            impl TransferPayload for $rxdma {
+            impl<PINS> TransferPayload for $rxdma<PINS> {
                 fn start(&mut self) {
                     self.channel.start();
                 }
@@ -537,7 +558,7 @@ macro_rules! serialdma {
                 }
             }
 
-            impl TransferPayload for $txdma {
+            impl<PINS> TransferPayload for $txdma<PINS> {
                 fn start(&mut self) {
                     self.channel.start();
                 }
@@ -546,8 +567,8 @@ macro_rules! serialdma {
                 }
             }
 
-            impl Rx<$USARTX> {
-                pub fn with_dma(self, channel: $dmarxch) -> $rxdma {
+            impl<PINS> Rx<$USARTX, PINS> {
+                pub fn with_dma(self, channel: $dmarxch) -> $rxdma<PINS> {
                     RxDma {
                         payload: self,
                         channel,
@@ -555,8 +576,8 @@ macro_rules! serialdma {
                 }
             }
 
-            impl Tx<$USARTX> {
-                pub fn with_dma(self, channel: $dmatxch) -> $txdma {
+            impl<PINS> Tx<$USARTX, PINS> {
+                pub fn with_dma(self, channel: $dmatxch) -> $txdma<PINS> {
                     TxDma {
                         payload: self,
                         channel,
@@ -564,8 +585,8 @@ macro_rules! serialdma {
                 }
             }
 
-            impl $rxdma {
-                pub fn split(mut self) -> (Rx<$USARTX>, $dmarxch) {
+            impl<PINS> $rxdma<PINS> {
+                pub fn split(mut self) -> (Rx<$USARTX, PINS>, $dmarxch) {
                     self.stop();
                     let RxDma {payload, channel} = self;
                     (
@@ -575,8 +596,8 @@ macro_rules! serialdma {
                 }
             }
 
-            impl $txdma {
-                pub fn split(mut self) -> (Tx<$USARTX>, $dmatxch) {
+            impl<PINS> $txdma<PINS> {
+                pub fn split(mut self) -> (Tx<$USARTX, PINS>, $dmatxch) {
                     self.stop();
                     let TxDma {payload, channel} = self;
                     (
@@ -586,7 +607,7 @@ macro_rules! serialdma {
                 }
             }
 
-            impl<B> crate::dma::CircReadDma<B, u8> for $rxdma where B: as_slice::AsMutSlice<Element=u8> {
+            impl<B, PINS> crate::dma::CircReadDma<B, u8> for $rxdma<PINS> where B: as_slice::AsMutSlice<Element=u8> {
                 fn circ_read(mut self, buffer: &'static mut [B; 2],
                 ) -> CircBuffer<B, Self>
                 {
@@ -614,7 +635,7 @@ macro_rules! serialdma {
                 }
             }
 
-            impl<B> crate::dma::ReadDma<B, u8> for $rxdma where B: as_slice::AsMutSlice<Element=u8> {
+            impl<B, PINS> crate::dma::ReadDma<B, u8> for $rxdma<PINS> where B: as_slice::AsMutSlice<Element=u8> {
                 fn read(mut self, buffer: &'static mut B,
                 ) -> Transfer<W, &'static mut B, Self>
                 {
@@ -639,7 +660,7 @@ macro_rules! serialdma {
                 }
             }
 
-            impl<A, B> crate::dma::WriteDma<A, B, u8> for $txdma where A: as_slice::AsSlice<Element=u8>, B: Static<A> {
+            impl<A, B, PINS> crate::dma::WriteDma<A, B, u8> for $txdma<PINS> where A: as_slice::AsSlice<Element=u8>, B: Static<A> {
                 fn write(mut self, buffer: B
                 ) -> Transfer<R, B, Self>
                 {
